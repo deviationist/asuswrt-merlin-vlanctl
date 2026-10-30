@@ -1,0 +1,4 @@
+# Playwright MCP browser-session artifacts (page snapshots, console logs)
+.playwright-mcp/
+vlanctl.conf
+vlanctl.history

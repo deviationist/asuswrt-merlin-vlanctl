@@ -1,0 +1,25 @@
+# /jffs/scripts/vlanctl.conf — sourced by vlanctl. The installer never writes
+# this file; `vlanctl add` / `vlanctl del` rewrite only the ACCESS_PORTS line.
+
+# Space-separated <port>:<vid>. <port> is a front-panel label from the model
+# map (`vlanctl ports`), <vid> an existing Guest Network Pro profile's VLAN
+# (`vlanctl status` lists them).
+ACCESS_PORTS=""
+# e.g. ACCESS_PORTS="LAN2:101 LAN4:101"
+
+# 1 = if a target VLAN disappears (profile deleted/disabled), power the port
+# DOWN instead of leaving the device on the main LAN. Off by default: vlanctl
+# otherwise never takes an action the firmware's own config does not support.
+FAIL_CLOSED=0
+
+# Backstop full switch read, in seconds. Between these, the watchdog only reads
+# the switch after the firmware has visibly rebuilt the VLAN table.
+VERIFY_EVERY=3600
+
+# After a check that could not confirm every port (unreadable switch, profile
+# gone, failed re-apply), look again this soon instead of waiting VERIFY_EVERY.
+RETRY_EVERY=300
+
+# Re-applies allowed per port per WINDOW before standing down (logged + history).
+MAXHEALS=6
+WINDOW=3600

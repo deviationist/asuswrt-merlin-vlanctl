@@ -1,0 +1,556 @@
+#!/bin/sh
+# vlanctl — wired-port VLAN control + watchdog for Asuswrt-Merlin.
+#
+# THE GAP: Guest Network Pro (SDN) profiles get their own VLAN, bridge, subnet
+# and firewall isolation, but on a standalone router there is no way to put a
+# LAN *port* into one. The LAN -> VLAN page that would do it does not ship on
+# every model/firmware (it is absent on the RT-BE92U, Merlin 3006.102.8), and
+# the `lanport` field in apgN_dut_list is ignored outside AiMesh (five formats
+# tested, rc never programmed an access port).
+#
+# The firmware already carries every SDN VLAN *tagged* on all LAN ports. What
+# is missing is "this port is an untagged member of VLAN N". vlanctl programs
+# exactly that on the external Realtek switch, with the same `rtkswitch` ioctls
+# rc itself uses, and re-asserts it whenever the firmware rebuilds the switch
+# VLAN table (boot, any SDN change, restart_apg_eth_vlan) — which silently puts
+# the port back on the main LAN.
+#
+# DESIGN RULE: when in doubt, do nothing. Unknown model, unreadable switch
+# state, a VLAN the firmware has not programmed — all SKIP, never a write. The
+# one deliberate exception is FAIL_CLOSED=1, which powers a port DOWN rather
+# than leave it on the main LAN.
+#
+# QUIET WHEN HEALTHY: every switch read prints to the kernel log, which syslogd
+# copies into /tmp/syslog.log. Reading the switch every minute would push
+# thousands of lines a day into the log the other addons depend on. So the
+# watchdog only reads the switch when the firmware has visibly rebuilt the VLAN
+# table since our last verdict (a `createVlan` kernel line newer than our last
+# APPLIED/VERIFIED/UNRESOLVED line), or every VERIFY_EVERY seconds.
+
+VERSION=0.1.0
+TAG=vlanctl
+
+# --- paths -----------------------------------------------------------------
+# Runtime state in /tmp (RAM). The two /jffs files are the operator's config
+# (written only by `add`/`del`, never by the watchdog or installer) and the
+# durable history (appended only when something actually happens).
+RUN=${VLANCTL_RUN:-/tmp/vlanctl}
+CONF=${VLANCTL_CONF:-/jffs/scripts/vlanctl.conf}
+HISTORY=${VLANCTL_HISTORY:-/jffs/scripts/vlanctl.history}
+HISTORY_MAX=200
+LOCKD="$RUN/lock.d"
+LOCK_STALE=600
+SYSLOG=${VLANCTL_SYSLOG:-/tmp/syslog.log}
+KMSG=${VLANCTL_KMSG:-/dev/kmsg}
+PROC=${VLANCTL_PROC:-/proc}   # overridable only so tests/ can stub liveness
+
+# --- tunables (override in $CONF) -------------------------------------------
+# Space-separated <port>:<vid> pairs. <port> is a front-panel label from the
+# model map below (e.g. LAN2). <vid> must be an existing SDN profile's VLAN.
+ACCESS_PORTS=""
+FAIL_CLOSED=0           # 1 = power a port down if its target VLAN is gone
+VERIFY_EVERY=3600       # backstop full switch read, seconds
+RETRY_EVERY=300         # re-check this soon after an unresolved verdict
+MAXHEALS=6              # re-applies per WINDOW, per port, before standing down
+WINDOW=3600
+
+[ -f "$CONF" ] && . "$CONF"
+
+mkdir -p "$RUN" 2>/dev/null
+
+log() { logger -t "$TAG" "$*"; [ -n "$VLANCTL_VERBOSE" ] && echo "$TAG: $*" >&2; }
+say() { echo "$*"; }
+now() { date +%s; }
+hex() { printf '0x%X' "$1"; }
+read_ts() {
+	_v=$(cat "$1" 2>/dev/null)
+	case "$_v" in ''|*[!0-9]*) echo 0 ;; *) echo "$_v" ;; esac
+}
+
+# Durable record. Trimmed in batches so a busy period is not a full flash
+# rewrite per line.
+hist() {
+	printf '%s\t%-12s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$HISTORY" 2>/dev/null || return 0
+	_hl=$(wc -l < "$HISTORY" 2>/dev/null || echo 0)
+	if [ "$_hl" -gt $((HISTORY_MAX + 50)) ] 2>/dev/null; then
+		tail -n "$HISTORY_MAX" "$HISTORY" > "$HISTORY.tmp" 2>/dev/null && mv "$HISTORY.tmp" "$HISTORY"
+	fi
+}
+
+# --- lock ----------------------------------------------------------------------
+# mkdir is atomic. Every command that writes to the switch takes it, so a cron
+# watchdog, a hook-triggered watchdog and a manual `apply` never interleave.
+# The pid file records the start time, so a hung or recycled-pid holder is
+# taken over after LOCK_STALE instead of blocking forever.
+lock_take() {
+	if ! mkdir "$LOCKD" 2>/dev/null; then
+		read -r _lp _lt < "$LOCKD/pid" 2>/dev/null
+		if [ -n "$_lp" ] && [ -d "$PROC/$_lp" ] && [ $(( $(now) - ${_lt:-0} )) -lt "$LOCK_STALE" ]; then
+			return 1
+		fi
+		rm -rf "$LOCKD"
+		mkdir "$LOCKD" 2>/dev/null || return 1
+	fi
+	echo "$$ $(now)" > "$LOCKD/pid"
+	trap 'lock_drop' EXIT INT TERM
+}
+lock_drop() { rm -rf "$LOCKD"; }
+
+# --- model map ---------------------------------------------------------------
+# Per model: the Realtek CPU-uplink bit, and front-panel label -> switch port
+# -> rtkswitch LAN index (used only to power-cycle a port). A model that is not
+# listed is refused outright: a wrong map would move the wrong port, and on a
+# headless router that can be the port carrying your SSH session.
+#
+# RT-BE92U (Merlin 3006.102.8), verified 2026-10-31:
+#   p3 = CPU uplink (2.5G, member of every VLAN)
+#   p5 = LAN2 — proven: the only 100M link, matching the router's own
+#        `ATE Get_WanLanStatus`; moving it moved the 100M device.
+#   p6, p7 = LAN3, LAN4 — both 1G; order inferred from rtkswitch's LAN index
+#        order (1->p5, 2->p6, 3->p7). NOT individually proven. Run `vlanctl
+#        ports` and unplug one cable to confirm before assigning them.
+#   LAN1 is not in the RTL8372 VID 0 member set (p4 carries PVID 4094 /
+#        vlan4094) and is unsupported.
+model_map() {
+	case "$(nvram get productid 2>/dev/null)" in
+		RT-BE92U)
+			CPU_BIT=$((0x08))
+			PORT_MAP="LAN2:5:1 LAN3:6:2 LAN4:7:3"
+			return 0 ;;
+	esac
+	return 1
+}
+
+# port_of <label> -> P (switch port), PBIT, PIDX. Returns 1 if unknown.
+port_of() {
+	P=""; PIDX=""
+	for _m in $PORT_MAP; do
+		case "$_m" in "$1":*)
+			P=$(echo "$_m" | cut -d: -f2); PIDX=$(echo "$_m" | cut -d: -f3) ;;
+		esac
+	done
+	[ -n "$P" ] || return 1
+	PBIT=$((1 << P))
+}
+
+# SDN VLAN ids the firmware declares (vlan_rl = <idx>vid>iso>...).
+sdn_vids() {
+	nvram get vlan_rl 2>/dev/null | sed 's/<[0-9]*>\([0-9]*\)>[0-9]*>/\1 /g'
+}
+
+# --- switch access -----------------------------------------------------------
+# rtkswitch answers on the kernel log, not stdout. Every read first writes a
+# unique marker to /dev/kmsg and parses only what follows it, so a failed ioctl
+# can never be mistaken for an answer by re-reading a stale line, and a wrapped
+# ring buffer cannot blind the check.
+rtk() { rtkswitch "$@" >/dev/null 2>&1; }
+
+MARKN=0
+kmark() {
+	MARKN=$((MARKN + 1))
+	MK="vlanctl-mark-$$-$MARKN"
+	echo "$MK" >> "$KMSG" 2>/dev/null
+}
+after_mark() { dmesg | sed -n "/$MK/,\$p"; }
+
+# read_vlan <vid> -> MBR, UNTAG (numeric). Returns 1 if unreadable.
+read_vlan() {
+	kmark || return 1
+	rtk 36 "$1"; rtk 399
+	_l=$(after_mark | grep "get vlan mbr/untag - vid = $1," | tail -1)
+	MBR=$(echo "$_l" | sed -n 's/.*mbrmsk = \(0x[0-9A-Fa-f]*\).*/\1/p')
+	UNTAG=$(echo "$_l" | sed -n 's/.*untagmsk = \(0x[0-9A-Fa-f]*\).*/\1/p')
+	[ -n "$MBR" ] && [ -n "$UNTAG" ] || return 1
+	MBR=$((MBR)); UNTAG=$((UNTAG))
+}
+
+# read_pvid <port> -> PVID. Returns 1 if unreadable.
+read_pvid() {
+	kmark || return 1
+	rtk 393
+	PVID=$(after_mark | grep "p$1 pvid=" | tail -1 | sed -n 's/.*pvid=\([0-9]*\).*/\1/p')
+	[ -n "$PVID" ]
+}
+
+# write_vlan <vid> <mbr> <untag> <cmd> — cmd 3902 for VID 0 (rc's variant with
+# the CPU port in mbr/untag), 390 for SDN VLANs. Encoding verified on a scratch
+# VLAN: arg = (untag << 16) | mbr.
+write_vlan() {
+	rtk 36 "$1"; rtk "$4" "$(hex $(( ($3 << 16) | $2 )))"
+}
+
+bounce() { # power-cycle a port so its client re-DHCPs on the new network
+	[ -n "$1" ] || return 1
+	rtk 13 "$1"; sleep 3; rtk 12 "$1"
+}
+
+# --- pure planning (no I/O; tests drive these directly) -----------------------
+plan_lan()    { NMBR=$(( $1 & ~$3 )); NUNTAG=$(( $2 & ~$3 )); }  # leave VID 0
+plan_target() { NMBR=$(( $1 | $3 ));  NUNTAG=$(( $2 | $3 )); }   # untagged member
+plan_other()  { NMBR=$(( $1 & ~$3 )); NUNTAG=$(( $2 & ~$3 )); }  # leave other SDN VLAN
+
+# --- assignments ---------------------------------------------------------------
+# Validates ACCESS_PORTS against the model map and the firmware's declared SDN
+# VLANs. Sets ASSIGN ("label:port:idx:vid ..."). Prints problems; returns 1 if
+# any entry is invalid (then nothing is applied at all).
+resolve_assignments() {
+	ASSIGN=""; _bad=0; _seen=" "
+	_vids=" $(sdn_vids) "
+	for _a in $ACCESS_PORTS; do
+		_lab=${_a%%:*}; _vid=${_a#*:}
+		case "$_vid" in ''|*[!0-9]*)
+			say "  $_a: VLAN id must be a number"; _bad=1; continue ;;
+		esac
+		if ! port_of "$_lab"; then
+			say "  $_a: unknown port '$_lab' for this model (known: $PORT_MAP)"; _bad=1; continue
+		fi
+		case "$_seen" in *" $_lab "*)
+			say "  $_a: $_lab is assigned more than once"; _bad=1; continue ;;
+		esac
+		_seen="$_seen$_lab "
+		case "$_vids" in *" $_vid "*) ;; *)
+			say "  $_a: VLAN $_vid is not an SDN profile VLAN (declared:$_vids)"; _bad=1; continue ;;
+		esac
+		ASSIGN="$ASSIGN $_lab:$P:$PIDX:$_vid"
+	done
+	return $_bad
+}
+
+# is_ok_one <port> <vid> -> 0 applied, 1 drifted, 2 cannot tell, 3 target
+# VLAN not programmed by the firmware (profile deleted/disabled). Sets WHY.
+is_ok_one() {
+	_bit=$((1 << $1))
+	read_vlan 0 || { WHY="VID 0 unreadable"; return 2; }
+	[ $((MBR & CPU_BIT)) -ne 0 ] || { WHY="VID 0 looks unprogrammed (mid-rebuild?)"; return 2; }
+	_l0m=$MBR
+	read_vlan "$2" || { WHY="VID $2 unreadable"; return 2; }
+	[ $((MBR & CPU_BIT)) -ne 0 ] || { WHY="VID $2 not programmed by firmware (profile gone?)"; return 3; }
+	read_pvid "$1" || { WHY="PVID p$1 unreadable"; return 2; }
+	if [ $((_l0m & _bit)) -ne 0 ]; then WHY="p$1 back in VID 0 (main LAN)"; return 1; fi
+	if [ $((UNTAG & _bit)) -eq 0 ]; then WHY="p$1 not untagged in VID $2"; return 1; fi
+	if [ "$PVID" != "$2" ]; then WHY="p$1 PVID $PVID, want $2"; return 1; fi
+	WHY="p$1 untagged on VID $2, PVID $2, off VID 0"; return 0
+}
+
+# apply_one <port> <vid> — idempotent. Reads EVERYTHING and gates on it before
+# the first write: a VLAN without the CPU port is unprogrammed or mid-rebuild,
+# and writing masks computed from it could empty VID 0 and cut off every wired
+# host. Then join before leave: target VLAN + PVID first, VID 0 after, so the
+# port is never in no VLAN at all. Unchanged masks are not rewritten.
+apply_one() {
+	_bit=$((1 << $1))
+	read_vlan "$2" || { WHY="VID $2 unreadable"; return 2; }
+	[ $((MBR & CPU_BIT)) -ne 0 ] || { WHY="VID $2 not programmed"; return 3; }
+	_tm=$MBR; _tu=$UNTAG
+	read_vlan 0 || { WHY="VID 0 unreadable"; return 2; }
+	[ $((MBR & CPU_BIT)) -ne 0 ] || { WHY="VID 0 looks unprogrammed"; return 2; }
+	_lm=$MBR; _lu=$UNTAG
+	read_pvid "$1" || { WHY="PVID p$1 unreadable"; return 2; }
+	_others=""
+	for _v in $(sdn_vids); do
+		[ "$_v" = "$2" ] && continue
+		read_vlan "$_v" || { WHY="VID $_v unreadable"; return 2; }
+		# Only VLANs that are programmed AND carry this port need a write.
+		[ $((MBR & CPU_BIT)) -ne 0 ] && [ $((MBR & _bit)) -ne 0 ] && _others="$_others $_v:$MBR:$UNTAG"
+	done
+
+	plan_target "$_tm" "$_tu" "$_bit"
+	[ "$NMBR" = "$_tm" ] && [ "$NUNTAG" = "$_tu" ] || write_vlan "$2" "$NMBR" "$NUNTAG" 390
+	[ "$PVID" = "$2" ] || { rtk 36 "$2"; rtk 3911 "$(hex $_bit)"; }
+	plan_lan "$_lm" "$_lu" "$_bit"
+	[ "$NMBR" = "$_lm" ] && [ "$NUNTAG" = "$_lu" ] || write_vlan 0 "$NMBR" "$NUNTAG" 3902
+	for _o in $_others; do
+		_ov=${_o%%:*}; _r=${_o#*:}; _om=${_r%%:*}; _ou=${_r#*:}
+		plan_other "$_om" "$_ou" "$_bit"; write_vlan "$_ov" "$NMBR" "$NUNTAG" 390
+	done
+	rtk 3953 "$(hex $_bit)"   # untagged frames only: no tagging into other VLANs
+	return 0
+}
+
+# verdict ok|unresolved <detail> — one syslog marker per verification, which is
+# what tells the watchdog "nothing new since". OK sleeps for VERIFY_EVERY;
+# unresolved re-checks after RETRY_EVERY, so a transient bad read cannot hide
+# a port on the main LAN for an hour.
+verdict() {
+	sleep 1   # let the kernel lines from our own reads/writes reach syslog first
+	if [ "$1" = ok ]; then
+		log "$2"
+		now > "$RUN/lastverify"
+	else
+		log "UNRESOLVED $2"
+		echo $(( $(now) - VERIFY_EVERY + RETRY_EVERY )) > "$RUN/lastverify"
+	fi
+}
+
+# Has the firmware rebuilt the switch VLAN table since our last verdict?
+# 0 = yes / cannot tell (go verify), 1 = no.
+firmware_rebuilt() {
+	[ -f "$SYSLOG" ] || return 0
+	_lk=$(grep -n 'kernel: createVlan' "$SYSLOG" | tail -1 | cut -d: -f1)
+	_la=$(grep -nE "$TAG: (APPLIED|VERIFIED|UNRESOLVED)" "$SYSLOG" | tail -1 | cut -d: -f1)
+	[ -z "$_la" ] && return 0                 # rotated away: verify
+	[ -z "$_lk" ] && return 1
+	[ "$_lk" -gt "$_la" ] && return 0
+	return 1
+}
+
+heals_in_window() {
+	_cut=$(( $(now) - WINDOW ))
+	awk -v c="$_cut" '$1 >= c' "$RUN/heals.$1" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# fail_closed <label> <idx> <why> — power the port down if the operator opted
+# in. History only on the transition, not every retry.
+fail_closed() {
+	[ "$FAIL_CLOSED" = "1" ] || return 0
+	rtk 13 "$2"
+	if [ ! -f "$RUN/failclosed.$1" ]; then
+		: > "$RUN/failclosed.$1"
+		log "FAIL-CLOSED $1 powered down: $3"; hist FAIL-CLOSED "$1: $3"
+	fi
+}
+
+# --- core: one pass over every assignment --------------------------------------
+# mode = apply (manual: report to stdout) | watchdog (log + rate limits).
+# Caller holds the lock. Ends with exactly one verdict.
+reconcile() {
+	_mode=$1; _all=1; _did=0
+	for _a in $ASSIGN; do
+		_lab=${_a%%:*}; _r=${_a#*:}; _p=${_r%%:*}; _r=${_r#*:}; _idx=${_r%%:*}; _vid=${_a##*:}
+		is_ok_one "$_p" "$_vid"; _s=$?
+		case $_s in
+			0)
+				rm -f "$RUN/failclosed.$_lab" "$RUN/standdown.$_lab"
+				[ "$_mode" = apply ] && say "ok      $_lab on VLAN $_vid" ;;
+			1)
+				if [ "$_mode" = watchdog ] && [ "$(heals_in_window "$_lab")" -ge "$MAXHEALS" ]; then
+					if [ ! -f "$RUN/standdown.$_lab" ]; then
+						: > "$RUN/standdown.$_lab"
+						log "STANDING DOWN $_lab: $MAXHEALS re-applies in ${WINDOW}s, still drifting ($WHY)"
+						hist STAND-DOWN "$_lab: $MAXHEALS re-applies in ${WINDOW}s — $WHY"
+					fi
+					_all=0; continue
+				fi
+				_why=$WHY
+				apply_one "$_p" "$_vid"; _ar=$?
+				if [ $_ar -ne 0 ]; then
+					_all=0
+					log "SKIP $_lab: apply aborted before writing ($WHY)"
+					[ "$_mode" = apply ] && say "SKIP    $_lab: apply aborted before writing ($WHY)"
+					[ $_ar -eq 3 ] && fail_closed "$_lab" "$_idx" "$WHY"
+					continue
+				fi
+				bounce "$_idx"
+				[ "$_mode" = watchdog ] && now >> "$RUN/heals.$_lab"
+				if is_ok_one "$_p" "$_vid"; then
+					_did=1
+					if [ "$_mode" = watchdog ]; then
+						log "REAPPLIED $_lab -> VLAN $_vid (was: $_why)"; hist REAPPLIED "$_lab -> VLAN $_vid (was: $_why)"
+					else
+						say "applied $_lab -> VLAN $_vid"
+					fi
+				else
+					_all=0
+					log "FAILED $_lab -> VLAN $_vid: $WHY"; hist FAILED "$_lab -> VLAN $_vid: $WHY"
+					[ "$_mode" = apply ] && say "FAILED  $_lab -> VLAN $_vid: $WHY"
+				fi ;;
+			3)
+				_all=0
+				log "SKIP $_lab: $WHY"
+				[ "$_mode" = apply ] && say "SKIP    $_lab: $WHY"
+				fail_closed "$_lab" "$_idx" "$WHY" ;;
+			*)
+				_all=0
+				log "SKIP $_lab: $WHY"
+				[ "$_mode" = apply ] && say "SKIP    $_lab: $WHY" ;;
+		esac
+	done
+	if [ "$_all" = 1 ]; then
+		if [ "$_did" = 1 ]; then verdict ok "APPLIED $ACCESS_PORTS"; else verdict ok "VERIFIED $ACCESS_PORTS"; fi
+		return 0
+	fi
+	verdict unresolved "$ACCESS_PORTS"
+	return 1
+}
+
+busy() { say "vlanctl is busy (another run holds $LOCKD) — try again in a minute"; return 2; }
+
+# --- commands --------------------------------------------------------------------
+cmd_ports() {
+	model_map || { say "unsupported model: $(nvram get productid)"; return 2; }
+	say "Router-reported port status (ATE): $(ATE Get_WanLanStatus 2>/dev/null)"
+	say "  (W=WAN, L=LAN; X=down, M=100M, G=1G — labels are the firmware's)"
+	say ""
+	for _m in $PORT_MAP; do
+		_lab=${_m%%:*}; _p=$(echo "$_m" | cut -d: -f2)
+		_pv="?"; read_pvid "$_p" && _pv=$PVID
+		printf '  %-5s switch port p%s  PVID %s\n' "$_lab" "$_p" "$_pv"
+	done
+}
+
+# Read-only. Never touches watchdog state.
+cmd_check() {
+	model_map || { say "SKIP    unsupported model: $(nvram get productid)"; return 2; }
+	resolve_assignments || return 2
+	[ -n "$ASSIGN" ] || { say "nothing assigned (ACCESS_PORTS empty in $CONF)"; return 0; }
+	_rc=0
+	for _a in $ASSIGN; do
+		_lab=${_a%%:*}; _r=${_a#*:}; _p=${_r%%:*}; _vid=${_a##*:}
+		is_ok_one "$_p" "$_vid"
+		case $? in
+			0) printf 'OK      %-5s %s\n' "$_lab" "$WHY" ;;
+			1) printf 'DRIFTED %-5s %s\n' "$_lab" "$WHY"; _rc=1 ;;
+			*) printf 'SKIP    %-5s %s\n' "$_lab" "$WHY"; [ $_rc = 0 ] && _rc=2 ;;
+		esac
+	done
+	return $_rc
+}
+
+do_apply() {
+	model_map || { say "unsupported model: $(nvram get productid)"; return 2; }
+	resolve_assignments || return 2
+	[ -n "$ASSIGN" ] || { say "nothing assigned"; return 0; }
+	reconcile apply
+}
+
+cmd_apply() { lock_take || { busy; return 2; }; do_apply; }
+
+cmd_watchdog() {
+	[ -n "$ACCESS_PORTS" ] || return 0
+	model_map || return 0
+	_due=$(( $(now) - $(read_ts "$RUN/lastverify") ))
+	if ! firmware_rebuilt && [ "$_due" -lt "$VERIFY_EVERY" ]; then
+		return 0
+	fi
+	lock_take || return 0
+	if ! resolve_assignments >/dev/null; then
+		verdict unresolved "config invalid, run 'vlanctl check'"
+		return 0
+	fi
+	reconcile watchdog
+}
+
+# Rewrite the ACCESS_PORTS line of $CONF (creating it if needed). Input has
+# already passed resolve_assignments (labels from the map, numeric VIDs).
+conf_set_ports() {
+	[ -f "$CONF" ] || printf '# vlanctl config — see vlanctl.conf.example\n' > "$CONF"
+	if grep -q '^ACCESS_PORTS=' "$CONF"; then
+		sed -i "s|^ACCESS_PORTS=.*|ACCESS_PORTS=\"$1\"|" "$CONF"
+	else
+		echo "ACCESS_PORTS=\"$1\"" >> "$CONF"
+	fi
+	ACCESS_PORTS="$1"
+}
+
+cmd_add() {
+	[ -n "$1" ] && [ -n "$2" ] || { say "usage: vlanctl add <port> <vid>"; return 2; }
+	model_map || { say "unsupported model: $(nvram get productid)"; return 2; }
+	lock_take || { busy; return 2; }
+	_new=""
+	for _a in $ACCESS_PORTS; do [ "${_a%%:*}" = "$1" ] || _new="$_new $_a"; done
+	_old=$ACCESS_PORTS
+	ACCESS_PORTS="$_new $1:$2"
+	resolve_assignments || { ACCESS_PORTS=$_old; return 2; }
+	conf_set_ports "$(echo $ACCESS_PORTS)"
+	do_apply
+}
+
+# Removing a port: let the firmware rebuild its own defaults (which returns
+# every port to the main LAN), then re-apply whatever is still assigned, then
+# bounce the REMOVED port so its device re-DHCPs on the main LAN.
+cmd_del() {
+	[ -n "$1" ] || { say "usage: vlanctl del <port>"; return 2; }
+	model_map || { say "unsupported model: $(nvram get productid)"; return 2; }
+	port_of "$1" || { say "unknown port '$1' for this model (known: $PORT_MAP)"; return 2; }
+	_del_idx=$PIDX
+	lock_take || { busy; return 2; }
+	_new=""; _found=0
+	for _a in $ACCESS_PORTS; do
+		if [ "${_a%%:*}" = "$1" ]; then _found=1; else _new="$_new $_a"; fi
+	done
+	[ "$_found" = 1 ] || { say "$1 is not assigned"; return 2; }
+	conf_set_ports "$(echo $_new)"
+	rm -f "$RUN/heals.$1" "$RUN/standdown.$1" "$RUN/failclosed.$1"
+	service restart_apg_eth_vlan >/dev/null 2>&1; sleep 3
+	[ -n "$ACCESS_PORTS" ] && do_apply
+	bounce "$_del_idx"
+	log "REMOVED $1 (back on main LAN)"
+	say "$1 returned to the main LAN"
+}
+
+cmd_status() {
+	say "vlanctl $VERSION"
+	say ""
+	if ! model_map; then say "model: $(nvram get productid) — UNSUPPORTED, vlanctl will do nothing"; return 2; fi
+	say "model             : $(nvram get productid)"
+	say "ports (label:sw:idx): $PORT_MAP"
+	say "SDN VLANs (nvram) : $(sdn_vids)"
+	say "assigned          : ${ACCESS_PORTS:-<none>}"
+	say "fail-closed       : $FAIL_CLOSED"
+	say "watchdog cron     : $(cru l 2>/dev/null | grep -c vlanctl-wd) entry/entries"
+	for _a in $ACCESS_PORTS; do
+		say "re-applies ${_a%%:*}     : $(heals_in_window "${_a%%:*}")/$MAXHEALS in ${WINDOW}s"
+	done
+	say ""
+	say "switch VLAN table:"
+	for _v in 0 $(sdn_vids); do
+		read_vlan "$_v" && printf '  VID %-5s mbr %-6s untag %s\n' "$_v" "$(hex $MBR)" "$(hex $UNTAG)" \
+			|| printf '  VID %-5s <unreadable>\n' "$_v"
+	done
+	if [ -s "$HISTORY" ]; then
+		say ""; say "recent history:"; tail -3 "$HISTORY" | sed 's/^/  /'
+	fi
+	say ""
+	cmd_check
+}
+
+cmd_log() {
+	if [ -f "$SYSLOG" ]; then grep "$TAG" "$SYSLOG" | grep -v 'vlanctl-mark-' | tail -40
+	else logread 2>/dev/null | grep "$TAG" | tail -40; fi
+}
+
+cmd_history() {
+	[ -s "$HISTORY" ] && cat "$HISTORY" || say "No events recorded. (Written only when the firmware undid an assignment and vlanctl restored it, or a port stood down / failed closed.)"
+}
+
+# service-event-end entrypoint ($1 = action, $2 = service). Runs the watchdog
+# shortly after any service that can rebuild the switch VLAN table, so the
+# port is back where it belongs in seconds rather than at the next cron tick.
+# Detached: the hook must never hold up rc's service queue.
+cmd_hook() {
+	case "$2" in
+		apg*|sdn*|net_and_phy|net|wireless|mtlan*|switch*)
+			( sleep 5; "$0" watchdog ) >/dev/null 2>&1 & ;;
+	esac
+}
+
+# tests/ source this file for its functions only.
+[ -n "$VLANCTL_LIB" ] && return 0
+
+case "$1" in
+	hook)     cmd_hook "$2" "$3" ;;
+	ports)    cmd_ports ;;
+	check)    cmd_check ;;
+	status)   cmd_status ;;
+	apply)    cmd_apply ;;
+	add)      cmd_add "$2" "$3" ;;
+	del)      cmd_del "$2" ;;
+	watchdog) cmd_watchdog ;;
+	log)      cmd_log ;;
+	history)  cmd_history ;;
+	version)  say "vlanctl $VERSION" ;;
+	*)
+		say "vlanctl $VERSION — wired-port VLAN control for Asuswrt-Merlin"
+		say ""
+		say "usage: vlanctl {status|check|ports|apply|add <port> <vid>|del <port>|watchdog|log|history|version}"
+		say ""
+		say "  status        model, assignments, live switch VLAN table, check"
+		say "  check         verify each assignment, read-only (0=ok 1=drifted 2=unknown)"
+		say "  ports         port labels, switch ports, PVIDs, link status"
+		say "  apply         program every assignment now (idempotent)"
+		say "  add P V       assign port P (e.g. LAN2) untagged to SDN VLAN V, persist"
+		say "  del P         return port P to the main LAN, persist"
+		say "  watchdog      cron entrypoint: re-apply after firmware rebuilds"
+		say "  log|history   recent syslog lines | durable record of events"
+		exit 2 ;;
+esac
